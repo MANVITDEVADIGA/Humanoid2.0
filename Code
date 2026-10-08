@@ -1,0 +1,854 @@
+// ============================================================================
+//  ESP32 4WD Car - BTS7960 x2 - Open-loop distance control
+//  + 2x HC-SR04 ultrasonic sensors (front + rear obstacle stop)
+//  Protocol: Base,<dir>,<dist>,<speed>   (old format also supported)
+//  No encoders required. Pure C++ class/object design.
+// ============================================================================
+
+
+
+/*
+Base,F,<dist>,<speed>    Forward, stop after <dist> metres
+Base,B,<dist>,<speed>    Backward, stop after <dist> metres
+Base,L,0,<speed>         Pivot left, continuous
+Base,R,0,<speed>         Pivot right, continuous
+Base,S                   Stop
+*/
+
+/*ARM,B	All 8 servos to zero	Instant
+ARM,RH	Raise both hands	~1 second
+ARM,RS	Right hand shake	~3 seconds
+ARM,HB	Hold box sequence	~7 seconds*/
+
+
+/*HEAD,NCK CAL
+   HEAD,CAL*/
+
+
+
+
+
+
+
+
+
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <AccelStepper.h>    
+
+// ============================================================
+//  CONFIGURATION  (edit only this block)
+// ============================================================
+namespace Cfg {
+
+    // ---- UART ----
+    constexpr int   RX2_PIN         = 16;
+    constexpr int   TX2_PIN         = 17;
+    constexpr long  UART2_BAUD      = 9600;
+    constexpr long  USB_BAUD        = 115200;
+
+    // ---- Left BTS7960 ----
+    constexpr int   L_RPWM          = 4;
+    constexpr int   L_LPWM          = 5;
+    constexpr int   L_REN           = 13;
+    constexpr int   L_LEN           = 14;
+
+    // ---- Right BTS7960 ----
+    constexpr int   R_RPWM          = 15;
+    constexpr int   R_LPWM          = 18;
+    constexpr int   R_REN           = 19;
+    constexpr int   R_LEN           = 23;
+
+    // ---- Ultrasonic sensors (change to your wiring) ----
+    constexpr int   US_FRONT_TRIG   = 32;
+    constexpr int   US_FRONT_ECHO   = 35;
+    constexpr int   US_REAR_TRIG    = 12;
+    constexpr int   US_REAR_ECHO    = 36;
+
+    // ---- Obstacle threshold ----
+    constexpr float OBSTACLE_CM     = 14.0f; 
+    constexpr float US_MIN_CM       = 2.0f;      // ← ADD THIS
+    constexpr float US_MAX_CM       = 400.0f;    // ← ADD THIS  // stop if closer than this
+    constexpr unsigned long US_TIMEOUT_US = 25000UL;  // ~4 m max range
+    constexpr int   US_BAD_STRIKES  = 3; 
+    // ---- PWM ----
+    constexpr int   PWM_FREQ        = 20000;
+    constexpr int   PWM_RES         = 8;      // 0-255
+
+    // ---- Defaults ----
+    constexpr int   SPEED_FB        = 110;
+    constexpr int   SPEED_TURN      = 255;
+    constexpr int   MIN_PWM         = 60;
+
+    // ---- Open-loop speed model ----
+    constexpr float MAX_SPEED_MS    = 2.618f;
+
+    // ---- Safety timeout ----
+    constexpr unsigned long MOVE_TIMEOUT_MS = 30000;
+
+    // ---- Command chars ----
+    constexpr char  CMD_FORWARD     = 'F';
+    constexpr char  CMD_BACKWARD    = 'B';
+    constexpr char  CMD_LEFT        = 'L';
+    constexpr char  CMD_RIGHT       = 'R';
+    constexpr char  CMD_STOP        = 'S';
+
+    constexpr int   SPEED_LEVEL_MIN = 0;
+    constexpr int   SPEED_LEVEL_MAX = 10;
+}
+
+
+
+// ============================================================
+//  ARM CONFIGURATION
+// ============================================================
+namespace CfgArm {
+    constexpr uint8_t I2C_ADDR     = 0x40;
+    constexpr int     I2C_SDA      = 21;
+    constexpr int     I2C_SCL      = 22;
+    constexpr int     SERVO_FREQ   = 50;
+    constexpr int     SERVO_MIN_US = 500;
+    constexpr int     SERVO_MAX_US = 2500;
+}
+// ============================================================
+//  ROBOT HEAD CONFIGURATION
+// ============================================================
+namespace CfgHead {
+    // ---- Stepper motor pins ----
+    constexpr int STEP_PIN        = 26;
+    constexpr int DIR_PIN         = 27;
+    constexpr int EN_PIN          = 25;
+
+    // ---- Limit switches ----
+    constexpr int LIMIT_RIGHT_PIN = 2;
+    constexpr int LIMIT_LEFT_PIN  = 33;
+
+    // ---- Motor settings ----
+    constexpr int  STEPS_PER_REV    = 1600;
+    constexpr int  MOVE_SPEED       = 400;
+    constexpr int  TEST_ACCEL       = 400;
+    constexpr long MAX_TRAVEL_STEPS = STEPS_PER_REV * 4;
+}
+
+
+
+
+// ============================================================
+//  MotorDriver  -  wraps one BTS7960
+// ============================================================
+class MotorDriver {
+public:
+    MotorDriver(int rpwm, int lpwm, int ren, int len)
+        : _rpwm(rpwm), _lpwm(lpwm), _ren(ren), _len(len) {}
+
+    void begin() {
+        pinMode(_ren, OUTPUT);
+        pinMode(_len, OUTPUT);
+        digitalWrite(_ren, HIGH);
+        digitalWrite(_len, HIGH);
+        pwmAttach(_rpwm);
+        pwmAttach(_lpwm);
+        setSpeed(0);
+    }
+
+    // -255..255  positive = forward
+    void setSpeed(int speed) {
+        speed = constrain(speed, -255, 255);
+        if (speed >= 0) {
+            pwmWrite(_rpwm,  speed);
+            pwmWrite(_lpwm,  0);
+        } else {
+            pwmWrite(_rpwm,  0);
+            pwmWrite(_lpwm, -speed);
+        }
+    }
+
+    void brake() { setSpeed(0); }
+
+private:
+    int _rpwm, _lpwm, _ren, _len;
+
+    static void pwmAttach(int pin) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+        ledcAttach(pin, Cfg::PWM_FREQ, Cfg::PWM_RES);
+#else
+        static int ch = 0;
+        ledcSetup(ch, Cfg::PWM_FREQ, Cfg::PWM_RES);
+        ledcAttachPin(pin, ch);
+        ch++;
+#endif
+    }
+
+    static void pwmWrite(int pin, int duty) {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+        ledcWrite(pin, duty);
+#else
+        int ch = (pin == Cfg::L_RPWM) ? 0 :
+                 (pin == Cfg::L_LPWM) ? 1 :
+                 (pin == Cfg::R_RPWM) ? 2 : 3;
+        ledcWrite(ch, duty);
+#endif
+    }
+};
+
+// ============================================================
+//  Ultrasonic  -  wraps one HC-SR04
+// ============================================================
+class Ultrasonic {
+public:
+    Ultrasonic(int trigPin, int echoPin)
+        : _trig(trigPin), _echo(echoPin) {}
+
+    void begin() {
+        pinMode(_trig, OUTPUT);
+        pinMode(_echo, INPUT);
+        digitalWrite(_trig, LOW);
+        delay(50);
+    }
+
+    // Returns filtered distance in cm, or -1 if invalid
+    float readCM() {
+        float a = singleRead();
+        delayMicroseconds(100);
+        float b = singleRead();
+        delayMicroseconds(100);
+        float c = singleRead();
+
+        // Median of 3 — discards single-pulse noise
+        float med = median3(a, b, c);
+    if (med < Cfg::US_MIN_CM) return -1.0f;      // too small = fake
+    if (med > Cfg::US_MAX_CM) return -1.0f;      // too big   = fake
+    // -------------------------------------------
+
+    return med;                      // valid reading
+}
+
+      
+
+private:
+    int _trig, _echo;
+
+    float singleRead() {
+        digitalWrite(_trig, LOW);
+        delayMicroseconds(5);
+        digitalWrite(_trig, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(_trig, LOW);
+
+        unsigned long dur = pulseIn(_echo, HIGH, Cfg::US_TIMEOUT_US);
+        if (dur == 0) return -1.0f;
+        return dur * 0.0343f / 2.0f;
+    }
+
+    static float median3(float a, float b, float c) {
+        if (a > b) { float t = a; a = b; b = t; }
+        if (b > c) { float t = b; b = c; c = t; }
+        if (a > b) { float t = a; a = b; b = t; }
+        return b;
+    }
+};
+
+// ============================================================
+//  Car  -  owns motors + ultrasonic sensors + command logic
+// ============================================================
+class Car {
+public:
+    Car()
+        : _left (Cfg::L_RPWM, Cfg::L_LPWM, Cfg::L_REN, Cfg::L_LEN),
+          _right(Cfg::R_RPWM, Cfg::R_LPWM, Cfg::R_REN, Cfg::R_LEN),
+          _usFront(Cfg::US_FRONT_TRIG, Cfg::US_FRONT_ECHO),
+          _usRear (Cfg::US_REAR_TRIG,  Cfg::US_REAR_ECHO),
+          _mode(Mode::IDLE),
+          _distanceMode(false),
+          _moveEndTime(0),
+          _lastUsRead(0),
+          _frontCM(-1.0f),
+          _rearCM(-1.0f) {}
+
+    void begin() {
+        Serial.begin(Cfg::USB_BAUD);
+        Serial2.begin(Cfg::UART2_BAUD, SERIAL_8N1,
+                      Cfg::RX2_PIN, Cfg::TX2_PIN);
+
+        _left.begin();
+        _right.begin();
+        _usFront.begin();
+        _usRear.begin();
+
+        stop();
+        Serial.println("ESP32 motor controller ready");
+        Serial.println("New format: Base,F,2,7  |  Old: F2,7");
+        Serial.print("Obstacle stop at ");
+        Serial.print(Cfg::OBSTACLE_CM, 1);
+        Serial.println(" cm (front & rear)");
+    }
+
+    void update() {
+        // ---- Read ultrasonic every 60 ms (avoid blocking) ----
+        if (millis() - _lastUsRead >= 60) {
+            _lastUsRead = millis();
+            _frontCM = _usFront.readCM();
+            delay(30); 
+            _rearCM  = _usRear.readCM();
+        }
+
+        // ---- Obstacle safety check (overrides motion) ----
+        checkObstacle();
+
+       
+
+        // ---- Distance-mode timeout ----
+        if (_distanceMode && millis() >= _moveEndTime) {
+            stop();
+            Serial.println("Distance reached, stopped");
+        }
+    }
+
+    // ---------- Motion primitives ----------
+    void forward (int s) { _left.setSpeed( s); _right.setSpeed( s); _mode = Mode::FWD; }
+    void backward(int s) { _left.setSpeed(-s); _right.setSpeed(-s); _mode = Mode::BWD; }
+    void left    (int s) { _left.setSpeed(-s); _right.setSpeed( s); _mode = Mode::LEFT; }
+    void right   (int s) { _left.setSpeed( s); _right.setSpeed(-s); _mode = Mode::RIGHT; }
+
+    void stop() {
+        _left.brake();
+        _right.brake();
+        _distanceMode = false;
+        _mode         = Mode::IDLE;
+    }
+
+    // ========================================================
+    //  Obstacle safety check
+    // ========================================================
+    void checkObstacle() {
+    // --- Front sensor (only when moving forward) ---
+    if (_mode == Mode::FWD) {
+        bool bad = (_frontCM > 0 &&
+                    _frontCM > Cfg::US_MIN_CM &&
+                    _frontCM < Cfg::OBSTACLE_CM);
+        if (bad) _frontBad++;
+        else     _frontBad = 0;
+
+        if (_frontBad >= Cfg::US_BAD_STRIKES) {
+            stop();
+            Serial.print("FRONT OBSTACLE ");
+            Serial.print(_frontCM, 1);
+            Serial.println(" cm - STOP");
+            _frontBad = 0;
+        }
+    } else {
+        _frontBad = 0;
+    }
+
+    // --- Rear sensor (only when moving backward) ---
+    if (_mode == Mode::BWD) {
+        bool bad = (_rearCM > 0 &&
+                    _rearCM > Cfg::US_MIN_CM &&
+                    _rearCM < Cfg::OBSTACLE_CM);
+        if (bad) _rearBad++;
+        else     _rearBad = 0;
+
+        if (_rearBad >= Cfg::US_BAD_STRIKES) {
+            stop();
+            Serial.print("REAR OBSTACLE ");
+            Serial.print(_rearCM, 1);
+            Serial.println(" cm - STOP");
+            _rearBad = 0;
+        }
+    } else {
+        _rearBad = 0;
+    }
+}
+
+    // ========================================================
+    //  Command parser
+
+    // ========================================================
+    void handleCommand(String cmd) {
+        cmd.trim();
+        cmd.toUpperCase();
+        if (cmd.length() == 0) return;
+
+        Serial.print("RX: "); Serial.println(cmd);
+
+        char  c          = 0;
+        float dist       = 0.0f;
+        int   speedLevel = -1;
+
+        // ----- New format: Base,<dir>,<dist>,<speed> -----
+        if (cmd.startsWith("BASE,")) {
+            int p1 = cmd.indexOf(',', 0);
+            int p2 = cmd.indexOf(',', p1 + 1);
+            int p3 = (p2 >= 0) ? cmd.indexOf(',', p2 + 1) : -1;
+
+            if (p1 < 0 || (p1 + 1) >= (int)cmd.length()) {
+                Serial.println("Bad new-format command");
+                return;
+            }
+
+            c = cmd.charAt(p1 + 1);
+
+            if (p2 < 0) {                              // Base,S
+                if (c == Cfg::CMD_STOP) { stop(); Serial.println("STOP"); }
+                else                    Serial.println("Bad new-format command");
+                return;
+            }
+
+            if (p3 > 0) {
+                dist       = cmd.substring(p2 + 1, p3).toFloat();
+                speedLevel = cmd.substring(p3 + 1).toInt();
+            } else {
+                dist = cmd.substring(p2 + 1).toFloat();
+            }
+        }
+        // ----- Old format: <dir>[dist][,speed] -----
+        else {
+            c = cmd.charAt(0);
+            String rest = cmd.substring(1);
+            rest.trim();
+
+            int comma = rest.indexOf(',');
+            if (comma >= 0) {
+                dist = rest.substring(0, comma).toFloat();
+                String sp = rest.substring(comma + 1);
+                sp.trim();
+                if (sp.length() > 0) speedLevel = sp.toInt();
+            } else {
+                dist = rest.toFloat();
+            }
+        }
+
+        // ----- Resolve PWM -----
+        int pwm;
+        if (speedLevel >= 0) {
+            pwm = levelToPwm(speedLevel);
+        } else {
+            pwm = (c == Cfg::CMD_LEFT || c == Cfg::CMD_RIGHT)
+                  ? Cfg::SPEED_TURN : Cfg::SPEED_FB;
+        }
+
+        Serial.print("CMD: ");  Serial.print(c);
+        Serial.print("  dist: "); Serial.print(dist, 2);
+        Serial.print(" m  PWM: "); Serial.println(pwm);
+
+        // ----- Pre-check obstacle BEFORE starting motion -----
+        if (c == Cfg::CMD_FORWARD &&
+            _frontCM > 0 && _frontCM < Cfg::OBSTACLE_CM) {
+            Serial.print("BLOCKED: front obstacle at ");
+            Serial.print(_frontCM, 1);
+            Serial.println(" cm - ignoring F command");
+            return;
+        }
+        if (c == Cfg::CMD_BACKWARD &&
+            _rearCM > 0 && _rearCM < Cfg::OBSTACLE_CM) {
+            Serial.print("BLOCKED: rear obstacle at ");
+            Serial.print(_rearCM, 1);
+            Serial.println(" cm - ignoring B command");
+            return;
+        }
+
+        // ----- Dispatch -----
+        switch (c) {
+            case Cfg::CMD_FORWARD:  forward(pwm);  break;
+            case Cfg::CMD_BACKWARD: backward(pwm); break;
+            case Cfg::CMD_LEFT:     left(pwm);     break;
+            case Cfg::CMD_RIGHT:    right(pwm);    break;
+            case Cfg::CMD_STOP:     stop();        return;
+            default:
+                Serial.println("Unknown command");
+                return;
+        }
+
+        // ----- Distance mode for F/B with dist > 0 -----
+        if ((c == Cfg::CMD_FORWARD || c == Cfg::CMD_BACKWARD) && dist > 0.0f) {
+            float speedMS = Cfg::MAX_SPEED_MS * pwm / 255.0f;
+            if (speedMS < 0.05f) speedMS = 0.05f;
+
+            unsigned long travelMs = (unsigned long)((dist / speedMS) * 1000.0f);
+            if (travelMs > Cfg::MOVE_TIMEOUT_MS)
+                travelMs = Cfg::MOVE_TIMEOUT_MS;
+
+            _moveEndTime  = millis() + travelMs;
+            _distanceMode = true;
+
+            Serial.print("Moving for ");
+            Serial.print(travelMs);
+            Serial.println(" ms");
+        } else {
+            _distanceMode = false;
+        }
+    }
+
+private:
+    enum class Mode { IDLE, FWD, BWD, LEFT, RIGHT };
+
+    MotorDriver _left, _right;
+    Ultrasonic  _usFront, _usRear;
+
+    Mode          _mode;
+    bool          _distanceMode;
+    unsigned long _moveEndTime;
+
+    unsigned long _lastUsRead;
+    float         _frontCM;
+    float         _rearCM;
+    int _frontBad = 0;
+    int _rearBad  = 0;
+
+    // ---- Speed level 0..10 -> PWM MIN_PWM..255 ----
+    static int levelToPwm(int level) {
+        level = constrain(level,
+                          Cfg::SPEED_LEVEL_MIN, Cfg::SPEED_LEVEL_MAX);
+        return Cfg::MIN_PWM + (255 - Cfg::MIN_PWM) * level / 10;
+    }
+};
+
+
+
+
+// ============================================================
+//  Arm  -  8 servos via PCA9685
+// ============================================================
+class Arm {
+public:
+    Arm(uint8_t addr, int sda, int scl)
+        : _addr(addr), _sda(sda), _scl(scl), _pwm(addr) {}
+
+    void begin() {
+        Wire.begin(_sda, _scl);
+        _pwm.begin();
+        _pwm.setPWMFreq(CfgArm::SERVO_FREQ);
+        delay(500);
+        allZero();
+        Serial.println("Arm ready. Commands: ARM,RS / ARM,RH / ARM,HB / ARM,B");
+    }
+
+    void allZero() {
+        for (uint8_t ch = 0; ch < 8; ch++) moveServo(ch, 0);
+        Serial.println("ARM: ALL SERVOS -> ZERO");
+    }
+
+    void rightShake() {
+        Serial.println("ARM: RIGHT HAND SHAKE");
+        moveServo(R_SHOULDER, 45);
+        moveServo(R_WRIST, 0);
+        moveServo(R_GRIPPER, 0);
+        moveServo(L_SHOULDER, 0);
+        moveServo(L_ELBOW, 0);
+        moveServo(L_WRIST, 0);
+        moveServo(L_GRIPPER, 0);
+
+        for (int i = 0; i < 3; i++) {
+            moveServo(R_ELBOW, 30); delay(500);
+            moveServo(R_ELBOW, 60); delay(500);
+        }
+        moveServo(R_ELBOW, 30);
+        Serial.println("ARM: RIGHT SHAKE COMPLETE");
+    }
+
+    void raiseBothHands() {
+        Serial.println("ARM: BOTH HANDS RAISE");
+        moveServo(R_SHOULDER, 180);
+        moveServo(L_SHOULDER, 180);
+        moveServo(R_ELBOW, 0);
+        moveServo(R_WRIST, 0);
+        moveServo(R_GRIPPER, 0);
+        moveServo(L_ELBOW, 0);
+        moveServo(L_WRIST, 0);
+        moveServo(L_GRIPPER, 0);
+        Serial.println("ARM: BOTH HANDS RAISED");
+    }
+
+    void holdBox() {
+        Serial.println("ARM: HOLD BOX START");
+        moveServo(R_SHOULDER, 45); moveServo(L_SHOULDER, 45); delay(500);
+        moveServo(R_ELBOW, 90);    moveServo(L_ELBOW, 90);    delay(500);
+        moveServo(R_WRIST, 90);    moveServo(L_WRIST, 90);    delay(500);
+        moveServo(R_GRIPPER, 0);   moveServo(L_GRIPPER, 0);   delay(1000);
+        moveServo(R_GRIPPER, 180); moveServo(L_GRIPPER, 180); delay(1000);
+        Serial.println("ARM: BOX GRIPPED");
+        moveServo(R_ELBOW, 60);    moveServo(L_ELBOW, 60);    delay(2000);
+        Serial.println("ARM: BOX HELD");
+        moveServo(R_ELBOW, 90);    moveServo(L_ELBOW, 90);
+        Serial.println("ARM: HOLD BOX COMPLETE");
+    }
+
+    // Returns true if cmd matched an arm command
+    bool handleCommand(const String& cmd) {
+        if (cmd == "RS") { rightShake();     return true; }
+        if (cmd == "RH") { raiseBothHands(); return true; }
+        if (cmd == "HB") { holdBox();        return true; }
+        if (cmd == "B")  { allZero();        return true; }
+        return false;
+    }
+
+private:
+    static constexpr uint8_t R_SHOULDER = 0;
+    static constexpr uint8_t R_ELBOW    = 1;
+    static constexpr uint8_t R_WRIST    = 2;
+    static constexpr uint8_t R_GRIPPER  = 3;
+    static constexpr uint8_t L_SHOULDER = 4;
+    static constexpr uint8_t L_ELBOW    = 5;
+    static constexpr uint8_t L_WRIST    = 6;
+    static constexpr uint8_t L_GRIPPER  = 7;
+
+    uint8_t  _addr;
+    int      _sda, _scl;
+    Adafruit_PWMServoDriver _pwm;
+
+    void moveServo(uint8_t channel, int angle) {
+        angle = constrain(angle, 0, 180);
+        int pulseUs = map(angle, 0, 180,
+                          CfgArm::SERVO_MIN_US, CfgArm::SERVO_MAX_US);
+        uint16_t count = pulseToCount(pulseUs);
+        _pwm.setPWM(channel, 0, count);
+    }
+
+    static uint16_t pulseToCount(int pulseUs) {
+        return (uint32_t)pulseUs * 4096UL * CfgArm::SERVO_FREQ / 1000000UL;
+    }
+};
+
+
+
+// ============================================================
+//  RobotHead  -  NON-BLOCKING stepper head with limit homing
+// ============================================================
+class RobotHead {
+public:
+    RobotHead()
+        : _stepper(AccelStepper::DRIVER,
+                   CfgHead::STEP_PIN, CfgHead::DIR_PIN),
+          _state(State::WAIT_FOR_CMD),
+          _calibrationRequested(false),
+          _spanSteps(0),
+          _centerPos(0),
+          _posBeforeMove(0) {}
+
+    void begin() {
+        pinMode(CfgHead::EN_PIN, OUTPUT);
+        digitalWrite(CfgHead::EN_PIN, LOW);
+
+        pinMode(CfgHead::LIMIT_RIGHT_PIN, INPUT_PULLUP);
+        pinMode(CfgHead::LIMIT_LEFT_PIN,  INPUT_PULLUP);
+
+        _stepper.setMaxSpeed(CfgHead::MOVE_SPEED);
+        _stepper.setAcceleration(CfgHead::TEST_ACCEL);
+        _stepper.setMinPulseWidth(2);
+        _stepper.setCurrentPosition(0);
+
+        Serial.println("RobotHead ready. Command: HEAD,CAL");
+        Serial.print("RIGHT idle = ");
+        Serial.println(digitalRead(CfgHead::LIMIT_RIGHT_PIN));
+        Serial.print("LEFT  idle = ");
+        Serial.println(digitalRead(CfgHead::LIMIT_LEFT_PIN));
+    }
+
+    // Called every loop() — non-blocking
+    void update() {
+        switch (_state) {
+            case State::WAIT_FOR_CMD:  stateWait();         break;
+            case State::MOVE_RIGHT:    stateMoveRight();    break;
+            case State::MOVE_LEFT:     stateMoveLeft();     break;
+            case State::RETURN_CENTER: stateReturnCenter(); break;
+            case State::DONE:          stateDone();         break;
+        }
+    }
+
+    // Public API — main dispatcher calls this
+    void requestCalibration() {
+        _calibrationRequested = true;
+    }
+
+    bool isDone() const { return _state == State::DONE; }
+    long getPosition() { return _stepper.currentPosition(); }
+
+private:
+    enum class State {
+        WAIT_FOR_CMD,
+        MOVE_RIGHT,
+        MOVE_LEFT,
+        RETURN_CENTER,
+        DONE
+    };
+
+    AccelStepper _stepper;
+    State        _state;
+    bool         _calibrationRequested;
+    long         _spanSteps;
+    long         _centerPos;
+    long         _posBeforeMove;
+
+    // ---- WAIT ----
+    void stateWait() {
+        if (_calibrationRequested) {
+            _calibrationRequested = false;
+            Serial.println("[HEAD] Starting calibration...");
+            _stepper.moveTo(CfgHead::MAX_TRAVEL_STEPS);
+            _state = State::MOVE_RIGHT;
+        }
+    }
+
+    // ---- MOVE RIGHT (non-blocking) ----
+    void stateMoveRight() {
+        _stepper.run();
+
+        if (digitalRead(CfgHead::LIMIT_RIGHT_PIN) == LOW) {
+            _stepper.stop();
+            if (_stepper.distanceToGo() == 0) {
+                Serial.print("[HEAD] RIGHT limit at pos ");
+                Serial.println(_stepper.currentPosition());
+                delay(200);
+                _posBeforeMove = _stepper.currentPosition();
+                _stepper.moveTo(-CfgHead::MAX_TRAVEL_STEPS);
+                _state = State::MOVE_LEFT;
+            }
+            return;
+        }
+
+        if (_stepper.distanceToGo() == 0) {
+            Serial.println("[HEAD] RIGHT target reached WITHOUT switch");
+            _posBeforeMove = _stepper.currentPosition();
+            _stepper.moveTo(-CfgHead::MAX_TRAVEL_STEPS);
+            _state = State::MOVE_LEFT;
+        }
+    }
+
+    // ---- MOVE LEFT (non-blocking) ----
+    void stateMoveLeft() {
+        _stepper.run();
+
+        if (digitalRead(CfgHead::LIMIT_LEFT_PIN) == LOW) {
+            _stepper.stop();
+            if (_stepper.distanceToGo() == 0) {
+                long posAfter = _stepper.currentPosition();
+                _spanSteps = labs(_posBeforeMove - posAfter);
+                _stepper.setCurrentPosition(0);
+                _centerPos = _spanSteps / 2;
+
+                Serial.print("[HEAD] LEFT limit at pos 0 (span = ");
+                Serial.print(_spanSteps);
+                Serial.print(", center = ");
+                Serial.print(_centerPos);
+                Serial.println(")");
+
+                delay(200);
+                _stepper.moveTo(_centerPos);
+                _state = State::RETURN_CENTER;
+            }
+            return;
+        }
+
+        if (_stepper.distanceToGo() == 0) {
+            Serial.println("[HEAD] LEFT target reached WITHOUT switch");
+            long posAfter = _stepper.currentPosition();
+            _spanSteps = labs(_posBeforeMove - posAfter);
+            _stepper.setCurrentPosition(0);
+            _centerPos = _spanSteps / 2;
+            _stepper.moveTo(_centerPos);
+            _state = State::RETURN_CENTER;
+        }
+    }
+
+    // ---- RETURN CENTER (non-blocking) ----
+    void stateReturnCenter() {
+        _stepper.run();
+
+        if (_stepper.distanceToGo() == 0) {
+            Serial.print("[HEAD] At CENTER. Position = ");
+            Serial.println(_stepper.currentPosition());
+            Serial.println("[HEAD] DONE — holding position.");
+            _state = State::DONE;
+        }
+    }
+
+    // ---- DONE ----
+    void stateDone() {
+        if (_calibrationRequested) {
+            _calibrationRequested = false;
+            Serial.println("[HEAD] Re-running calibration...");
+            _stepper.moveTo(CfgHead::MAX_TRAVEL_STEPS);
+            _state = State::MOVE_RIGHT;
+        }
+    }
+};
+
+
+
+// ============================================================
+//  Global object + Arduino entry points
+// ============================================================
+Car car;
+Arm arm(CfgArm::I2C_ADDR, CfgArm::I2C_SDA, CfgArm::I2C_SCL);
+RobotHead head;
+
+void setup() {
+    car.begin();
+    arm.begin();
+    head.begin();
+}
+
+void loop() {
+    car.update();
+    head.update();
+
+       // ---- USB Serial ----
+    if (Serial.available()) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+        cmd.toUpperCase();
+        if (cmd.length() > 0) {
+            if (cmd.startsWith("ARM,")) {
+                String armCmd = cmd.substring(4);
+                armCmd.trim();
+                if (!arm.handleCommand(armCmd)) {
+                    Serial.print("Unknown ARM command: ");
+                    Serial.println(armCmd);
+                }
+            } else if (cmd.startsWith("HEAD,")) {
+                String headCmd = cmd.substring(5);
+                headCmd.trim();
+                if (headCmd == "CAL" || headCmd == "NCK CAL") {
+                    head.requestCalibration();
+                    Serial.println("[HEAD] Calibration requested");
+                } else {
+                    Serial.print("[HEAD] Unknown: ");
+                    Serial.println(headCmd);
+                }
+            } else {
+                car.handleCommand(cmd);
+            }
+        }
+    }
+
+      // ---- UART2 (NodeMCU) ----
+    if (Serial2.available()) {
+        String cmd = Serial2.readStringUntil('\n');
+        cmd.trim();
+        cmd.toUpperCase();
+        if (cmd.length() > 0) {
+            if (cmd.startsWith("ARM,")) {
+                String armCmd = cmd.substring(4);
+                armCmd.trim();
+                if (!arm.handleCommand(armCmd)) {
+                    Serial.print("Unknown ARM command: ");
+                    Serial.println(armCmd);
+                }
+            } else if (cmd.startsWith("HEAD,")) {
+                String headCmd = cmd.substring(5);
+                headCmd.trim();
+                if (headCmd == "CAL" || headCmd == "NCK CAL") {
+                    head.requestCalibration();
+                    Serial.println("[HEAD] Calibration requested");
+                } else {
+                    Serial.print("[HEAD] Unknown: ");
+                    Serial.println(headCmd);
+                }
+            } else {
+                car.handleCommand(cmd);
+            }
+        }
+    }
+}
