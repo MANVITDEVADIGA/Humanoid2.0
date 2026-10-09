@@ -21,9 +21,21 @@ ARM,RS	Right hand shake	~3 seconds
 ARM,HB	Hold box sequence	~7 seconds*/
 
 
-/*HEAD,NCK CAL
-   HEAD,CAL*/
 
+/*
+HS,HOME
+HS,FRONT
+HS,LEFT
+HS,RIGHT
+HS,UP
+HS,DOWN
+HS,STRAIGHT
+HS,SCAN
+
+ HS,PAN,0          HS,PAN,45       HS,PAN,90
+  HS,PAN,135      HS,PAN,180        HS,TILT,0     HS,TILT,45
+  HS,TILT,0       HS,TILT,45         HS,TILT,80     HS,LOOK,90,45
+  HS,LOOK,180,45    HS,LOOK,0,45      HS,LOOK,90,80   HS,LOOK,90,0*/
 
 
 
@@ -36,7 +48,7 @@ ARM,HB	Hold box sequence	~7 seconds*/
 #include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_PWMServoDriver.h>
-#include <AccelStepper.h>    
+   
 
 // ============================================================
 //  CONFIGURATION  (edit only this block)
@@ -112,26 +124,40 @@ namespace CfgArm {
     constexpr int     SERVO_MIN_US = 500;
     constexpr int     SERVO_MAX_US = 2500;
 }
-// ============================================================
-//  ROBOT HEAD CONFIGURATION
-// ============================================================
-namespace CfgHead {
-    // ---- Stepper motor pins ----
-    constexpr int STEP_PIN        = 26;
-    constexpr int DIR_PIN         = 27;
-    constexpr int EN_PIN          = 25;
 
-    // ---- Limit switches ----
-    constexpr int LIMIT_RIGHT_PIN = 2;
-    constexpr int LIMIT_LEFT_PIN  = 33;
+// ============================================================
+//  HEAD SERVO CONFIGURATION  (uses PCA9685 channels 8 and 9)
+// ============================================================
+namespace CfgHeadServo {
+    // ---- PCA9685 channels ----
+    constexpr uint8_t PAN_CHANNEL  = 8;    // 9th pin on PCA9685
+    constexpr uint8_t TILT_CHANNEL = 9;    // 10th pin on PCA9685
 
-    // ---- Motor settings ----
-    constexpr int  STEPS_PER_REV    = 1600;
-    constexpr int  MOVE_SPEED       = 400;
-    constexpr int  TEST_ACCEL       = 400;
-    constexpr long MAX_TRAVEL_STEPS = STEPS_PER_REV * 4;
+    // ---- Pan (left/right) ----
+    constexpr int PAN_RIGHT   = 0;      // full right
+    constexpr int PAN_FRONT   = 90;     // straight ahead (HOME)
+    constexpr int PAN_LEFT    = 180;    // full left
+
+    // ---- Tilt (up/down) ----
+    constexpr int TILT_DOWN     = 0;    // looking down
+    constexpr int TILT_STRAIGHT = 45;   // straight ahead
+    constexpr int TILT_UP       = 80;   // looking up
+
+    // ---- Limits (safe range for your servo) ----
+    constexpr int PAN_MIN   = 0;
+    constexpr int PAN_MAX   = 180;
+    constexpr int TILT_MIN  = 0;
+    constexpr int TILT_MAX  = 80;
+
+    // ---- Home position (on power-up) ----
+    constexpr int PAN_HOME  = PAN_FRONT;    // 90
+    constexpr int TILT_HOME = TILT_STRAIGHT; // 45
+
+    // ---- Servo pulse range (same as arm) ----
+    constexpr int  SERVO_FREQ   = 50;
+    constexpr int  SERVO_MIN_US = 500;
+    constexpr int  SERVO_MAX_US = 2500;
 }
-
 
 
 
@@ -516,6 +542,8 @@ public:
     Arm(uint8_t addr, int sda, int scl)
         : _addr(addr), _sda(sda), _scl(scl), _pwm(addr) {}
 
+    Adafruit_PWMServoDriver& getPwm() { return _pwm; }   // ← ADD THIS LINE
+
     void begin() {
         Wire.begin(_sda, _scl);
         _pwm.begin();
@@ -611,191 +639,179 @@ private:
     }
 };
 
-
-
 // ============================================================
-//  RobotHead  -  NON-BLOCKING stepper head with limit homing
+//  HeadServo  -  2 servos (pan + tilt) on PCA9685 channels 8,9
+//  Shares the same PCA9685 board as the Arm
 // ============================================================
-class RobotHead {
+class HeadServo {
 public:
-    RobotHead()
-        : _stepper(AccelStepper::DRIVER,
-                   CfgHead::STEP_PIN, CfgHead::DIR_PIN),
-          _state(State::WAIT_FOR_CMD),
-          _calibrationRequested(false),
-          _spanSteps(0),
-          _centerPos(0),
-          _posBeforeMove(0) {}
+    // Pass the same PCA9685 object by reference
+    HeadServo(Adafruit_PWMServoDriver& pwm) : _pwm(pwm) {}
 
+    // Called from setup() after arm.begin()
     void begin() {
-        pinMode(CfgHead::EN_PIN, OUTPUT);
-        digitalWrite(CfgHead::EN_PIN, LOW);
+        // Move to home position on power-up
+        _panAngle  = CfgHeadServo::PAN_HOME;
+        _tiltAngle = CfgHeadServo::TILT_HOME;
+        writePan(_panAngle);
+        writeTilt(_tiltAngle);
+        delay(300);
 
-        pinMode(CfgHead::LIMIT_RIGHT_PIN, INPUT_PULLUP);
-        pinMode(CfgHead::LIMIT_LEFT_PIN,  INPUT_PULLUP);
-
-        _stepper.setMaxSpeed(CfgHead::MOVE_SPEED);
-        _stepper.setAcceleration(CfgHead::TEST_ACCEL);
-        _stepper.setMinPulseWidth(2);
-        _stepper.setCurrentPosition(0);
-
-        Serial.println("RobotHead ready. Command: HEAD,CAL");
-        Serial.print("RIGHT idle = ");
-        Serial.println(digitalRead(CfgHead::LIMIT_RIGHT_PIN));
-        Serial.print("LEFT  idle = ");
-        Serial.println(digitalRead(CfgHead::LIMIT_LEFT_PIN));
+        Serial.println("HeadServo ready.");
+        Serial.print("  Pan home  = ");
+        Serial.print(_panAngle);
+        Serial.println(" deg (90 = front)");
+        Serial.print("  Tilt home = ");
+        Serial.print(_tiltAngle);
+        Serial.println(" deg (45 = straight)");
     }
 
-    // Called every loop() — non-blocking
-    void update() {
-        switch (_state) {
-            case State::WAIT_FOR_CMD:  stateWait();         break;
-            case State::MOVE_RIGHT:    stateMoveRight();    break;
-            case State::MOVE_LEFT:     stateMoveLeft();     break;
-            case State::RETURN_CENTER: stateReturnCenter(); break;
-            case State::DONE:          stateDone();         break;
-        }
+    // ---------- Public API ----------
+
+    // Set pan angle directly (0 = right, 90 = front, 180 = left)
+    void setPan(int angle) {
+        angle = constrain(angle, CfgHeadServo::PAN_MIN, CfgHeadServo::PAN_MAX);
+        _panAngle = angle;
+        writePan(angle);
+        Serial.print("HEAD: pan -> ");
+        Serial.println(angle);
     }
 
-    // Public API — main dispatcher calls this
-    void requestCalibration() {
-        _calibrationRequested = true;
+    // Set tilt angle directly (0 = down, 45 = straight, 80 = up)
+    void setTilt(int angle) {
+        angle = constrain(angle, CfgHeadServo::TILT_MIN, CfgHeadServo::TILT_MAX);
+        _tiltAngle = angle;
+        writeTilt(angle);
+        Serial.print("HEAD: tilt -> ");
+        Serial.println(angle);
     }
 
-    bool isDone() const { return _state == State::DONE; }
-    long getPosition() { return _stepper.currentPosition(); }
+    // Named positions
+    void lookFront() { setPan(CfgHeadServo::PAN_FRONT); }
+    void lookLeft()  { setPan(CfgHeadServo::PAN_LEFT);  }
+    void lookRight() { setPan(CfgHeadServo::PAN_RIGHT); }
+
+    void lookDown()     { setTilt(CfgHeadServo::TILT_DOWN); }
+    void lookStraight() { setTilt(CfgHeadServo::TILT_STRAIGHT); }
+    void lookUp()       { setTilt(CfgHeadServo::TILT_UP); }
+
+    // Return to home (90 pan, 45 tilt)
+    void home() {
+        setPan(CfgHeadServo::PAN_HOME);
+        setTilt(CfgHeadServo::TILT_HOME);
+        Serial.println("HEAD: HOME");
+    }
+
+    // Simple scan: pan left, pan right, return front
+    void scan() {
+        Serial.println("HEAD: scanning...");
+        setPan(CfgHeadServo::PAN_LEFT);
+        delay(600);
+        setPan(CfgHeadServo::PAN_RIGHT);
+        delay(600);
+        setPan(CfgHeadServo::PAN_FRONT);
+        delay(400);
+        Serial.println("HEAD: scan done");
+    }
+
+    // Combined: look at a direction and tilt
+    void look(int panAngle, int tiltAngle) {
+        setPan(panAngle);
+        setTilt(tiltAngle);
+    }
+
+    int getPan()  const { return _panAngle;  }
+    int getTilt() const { return _tiltAngle; }
 
 private:
-    enum class State {
-        WAIT_FOR_CMD,
-        MOVE_RIGHT,
-        MOVE_LEFT,
-        RETURN_CENTER,
-        DONE
-    };
+    Adafruit_PWMServoDriver& _pwm;      // reference to shared board
+    int _panAngle  = 90;
+    int _tiltAngle = 45;
 
-    AccelStepper _stepper;
-    State        _state;
-    bool         _calibrationRequested;
-    long         _spanSteps;
-    long         _centerPos;
-    long         _posBeforeMove;
-
-    // ---- WAIT ----
-    void stateWait() {
-        if (_calibrationRequested) {
-            _calibrationRequested = false;
-            Serial.println("[HEAD] Starting calibration...");
-            _stepper.moveTo(CfgHead::MAX_TRAVEL_STEPS);
-            _state = State::MOVE_RIGHT;
-        }
+    void writePan(int angle) {
+        writeServo(CfgHeadServo::PAN_CHANNEL, angle);
     }
 
-    // ---- MOVE RIGHT (non-blocking) ----
-    void stateMoveRight() {
-        _stepper.run();
-
-        if (digitalRead(CfgHead::LIMIT_RIGHT_PIN) == LOW) {
-            _stepper.stop();
-            if (_stepper.distanceToGo() == 0) {
-                Serial.print("[HEAD] RIGHT limit at pos ");
-                Serial.println(_stepper.currentPosition());
-                delay(200);
-                _posBeforeMove = _stepper.currentPosition();
-                _stepper.moveTo(-CfgHead::MAX_TRAVEL_STEPS);
-                _state = State::MOVE_LEFT;
-            }
-            return;
-        }
-
-        if (_stepper.distanceToGo() == 0) {
-            Serial.println("[HEAD] RIGHT target reached WITHOUT switch");
-            _posBeforeMove = _stepper.currentPosition();
-            _stepper.moveTo(-CfgHead::MAX_TRAVEL_STEPS);
-            _state = State::MOVE_LEFT;
-        }
+    void writeTilt(int angle) {
+        writeServo(CfgHeadServo::TILT_CHANNEL, angle);
     }
 
-    // ---- MOVE LEFT (non-blocking) ----
-    void stateMoveLeft() {
-        _stepper.run();
-
-        if (digitalRead(CfgHead::LIMIT_LEFT_PIN) == LOW) {
-            _stepper.stop();
-            if (_stepper.distanceToGo() == 0) {
-                long posAfter = _stepper.currentPosition();
-                _spanSteps = labs(_posBeforeMove - posAfter);
-                _stepper.setCurrentPosition(0);
-                _centerPos = _spanSteps / 2;
-
-                Serial.print("[HEAD] LEFT limit at pos 0 (span = ");
-                Serial.print(_spanSteps);
-                Serial.print(", center = ");
-                Serial.print(_centerPos);
-                Serial.println(")");
-
-                delay(200);
-                _stepper.moveTo(_centerPos);
-                _state = State::RETURN_CENTER;
-            }
-            return;
-        }
-
-        if (_stepper.distanceToGo() == 0) {
-            Serial.println("[HEAD] LEFT target reached WITHOUT switch");
-            long posAfter = _stepper.currentPosition();
-            _spanSteps = labs(_posBeforeMove - posAfter);
-            _stepper.setCurrentPosition(0);
-            _centerPos = _spanSteps / 2;
-            _stepper.moveTo(_centerPos);
-            _state = State::RETURN_CENTER;
-        }
-    }
-
-    // ---- RETURN CENTER (non-blocking) ----
-    void stateReturnCenter() {
-        _stepper.run();
-
-        if (_stepper.distanceToGo() == 0) {
-            Serial.print("[HEAD] At CENTER. Position = ");
-            Serial.println(_stepper.currentPosition());
-            Serial.println("[HEAD] DONE — holding position.");
-            _state = State::DONE;
-        }
-    }
-
-    // ---- DONE ----
-    void stateDone() {
-        if (_calibrationRequested) {
-            _calibrationRequested = false;
-            Serial.println("[HEAD] Re-running calibration...");
-            _stepper.moveTo(CfgHead::MAX_TRAVEL_STEPS);
-            _state = State::MOVE_RIGHT;
-        }
+    void writeServo(uint8_t channel, int angle) {
+        angle = constrain(angle, 0, 180);
+        int pulseUs = map(angle, 0, 180,
+                          CfgHeadServo::SERVO_MIN_US,
+                          CfgHeadServo::SERVO_MAX_US);
+        uint16_t count = (uint32_t)pulseUs * 4096UL *
+                         CfgHeadServo::SERVO_FREQ / 1000000UL;
+        _pwm.setPWM(channel, 0, count);
     }
 };
-
-
 
 // ============================================================
 //  Global object + Arduino entry points
 // ============================================================
 Car car;
 Arm arm(CfgArm::I2C_ADDR, CfgArm::I2C_SDA, CfgArm::I2C_SCL);
-RobotHead head;
+HeadServo headServo(arm.getPwm());
+
+// ============================================================
+//  Head servo command handler
+// ============================================================
+void handleHeadServoCommand(String cmd) {
+    cmd.trim();
+    cmd.toUpperCase();
+    if (cmd.length() == 0) return;
+
+    if (cmd == "HOME")     { headServo.home();         return; }
+    if (cmd == "FRONT")    { headServo.lookFront();    return; }
+    if (cmd == "LEFT")     { headServo.lookLeft();     return; }
+    if (cmd == "RIGHT")    { headServo.lookRight();    return; }
+    if (cmd == "DOWN")     { headServo.lookDown();     return; }
+    if (cmd == "STRAIGHT") { headServo.lookStraight(); return; }
+    if (cmd == "UP")       { headServo.lookUp();       return; }
+    if (cmd == "SCAN")     { headServo.scan();         return; }
+
+    if (cmd.startsWith("PAN,")) {
+        int angle = cmd.substring(4).toInt();
+        headServo.setPan(angle);
+        return;
+    }
+
+    if (cmd.startsWith("TILT,")) {
+        int angle = cmd.substring(5).toInt();
+        headServo.setTilt(angle);
+        return;
+    }
+
+    if (cmd.startsWith("LOOK,")) {
+        String rest = cmd.substring(5);
+        int comma = rest.indexOf(',');
+        if (comma > 0) {
+            int pan  = rest.substring(0, comma).toInt();
+            int tilt = rest.substring(comma + 1).toInt();
+            headServo.look(pan, tilt);
+            return;
+        }
+    }
+
+    Serial.print("[HS] Unknown: ");
+    Serial.println(cmd);
+}
+
 
 void setup() {
     car.begin();
     arm.begin();
-    head.begin();
+    headServo.begin();
 }
 
 void loop() {
     car.update();
-    head.update();
+
 
        // ---- USB Serial ----
-    if (Serial.available()) {
+    
+         if (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim();
         cmd.toUpperCase();
@@ -807,24 +823,18 @@ void loop() {
                     Serial.print("Unknown ARM command: ");
                     Serial.println(armCmd);
                 }
-            } else if (cmd.startsWith("HEAD,")) {
-                String headCmd = cmd.substring(5);
-                headCmd.trim();
-                if (headCmd == "CAL" || headCmd == "NCK CAL") {
-                    head.requestCalibration();
-                    Serial.println("[HEAD] Calibration requested");
-                } else {
-                    Serial.print("[HEAD] Unknown: ");
-                    Serial.println(headCmd);
-                }
+            } else if (cmd.startsWith("HS,")) {
+                String hsCmd = cmd.substring(3);
+                hsCmd.trim();
+                handleHeadServoCommand(hsCmd);
             } else {
                 car.handleCommand(cmd);
             }
         }
     }
 
-      // ---- UART2 (NodeMCU) ----
-    if (Serial2.available()) {
+     // ---- UART2 (NodeMCU) ----
+      if (Serial2.available()) {
         String cmd = Serial2.readStringUntil('\n');
         cmd.trim();
         cmd.toUpperCase();
@@ -836,16 +846,10 @@ void loop() {
                     Serial.print("Unknown ARM command: ");
                     Serial.println(armCmd);
                 }
-            } else if (cmd.startsWith("HEAD,")) {
-                String headCmd = cmd.substring(5);
-                headCmd.trim();
-                if (headCmd == "CAL" || headCmd == "NCK CAL") {
-                    head.requestCalibration();
-                    Serial.println("[HEAD] Calibration requested");
-                } else {
-                    Serial.print("[HEAD] Unknown: ");
-                    Serial.println(headCmd);
-                }
+            } else if (cmd.startsWith("HS,")) {
+                String hsCmd = cmd.substring(3);
+                hsCmd.trim();
+                handleHeadServoCommand(hsCmd);
             } else {
                 car.handleCommand(cmd);
             }
